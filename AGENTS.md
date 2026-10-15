@@ -78,6 +78,10 @@ theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯�
   「代理回源全部 502」，而源码直跑完全正常（很容易误判成网络问题）。
 - `main.py --selftest`：打包后自检（CA 证书包 + 6 家镜像测速 + 代理缓存），结果写
   `%TEMP%\npm-accelerator-selftest.txt`，退出码 0 表示通过；windowed 模式没有 stdout，别再靠 print 判断。
+- **版本信息只有一处来源**：`version.py` 的 `__version__`（还有作者、项目代号）。编译时由
+  `NPM加速器.spec` 生成两个不入库的文件：`build_info.py`（运行时读取 → 窗口标题、自检输出）
+  与 `version_info.txt`（写进 exe 的 Windows 文件属性）。发新版只改 `__version__` 再重新编译，
+  界面上写的日期永远是「本次编译日期」，不会和源码里的固定字符串脱节。
 
 ## 测试方式
 
