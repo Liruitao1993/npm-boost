@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller
+build/
+dist/
+
+# 编译时生成（由 NPM加速器.spec 写出，不入库）
+build_info.py
+version_info.txt
+
+# 本机 AI 工具脚手架（不属于应用本体，需要时可自行去掉这段）
+.trellis/
+.claude/
+.cursor/
+.workbuddy/
+
+# 运行时产物
+*.log
