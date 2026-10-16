@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """主窗口：加速中心 / 镜像源 / 本地缓存代理 / GitHub 加速 / 项目助手 / 日志。"""
+import socket
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QStatusBar, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
@@ -13,7 +14,9 @@ from PySide6.QtWidgets import (
 import github_boost
 import npm_manager
 import proxy_server
+import speed_meter
 import theme
+import tray
 import version
 from workers import (EnvInfoThread, GithubActionThread, GithubSpeedThread,
                      NpmCommandThread, ProxyActionThread, SpeedTestThread)
@@ -36,6 +39,16 @@ def card(title: str = None) -> tuple:
         vbox.addWidget(lbl)
     return frame, vbox
 
+def _port_alive(port: int, host: str = "127.0.0.1") -> bool:
+    """本机某个端口是否已在监听（用来判断「另一个实例正在提供加速」）。"""
+    try:
+        with socket.socket() as probe:
+            probe.settimeout(0.5)
+            return probe.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
 class MainWindow(QMainWindow):
     log_signal = Signal(str)
 
@@ -45,6 +58,8 @@ class MainWindow(QMainWindow):
         self.resize(980, 680)
         # 后台线程引用：QThread 运行中被 Python 回收会让进程直接崩溃
         self._jobs = []
+        self._quitting = False        # 区分「真正退出」与「最小化到托盘」
+        self.close_to_tray = True     # 真实值由托盘菜单 / 界面勾选框决定
         self.speed_thread = None
         self.cmd_thread = None
         self.env_thread = None
@@ -57,9 +72,11 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.log_signal.connect(self._append_log)
         self._repair_dangling_proxy_registry()
+        self._repair_dangling_git_proxy()
         self.refresh_env()
         self.refresh_proxy_panel()
         self.refresh_github_panel()
+        self._init_tray_and_meter()
 
         # 代理统计刷新定时器
         self.stat_timer = QTimer(self)
@@ -123,6 +140,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._tab_log(), "日志")
 
         self.setStatusBar(QStatusBar())
+        self.lbl_speed = QLabel("↓ 0 B/s   ↑ 0 B/s")
+        self.lbl_speed.setObjectName("speedStatus")
+        self.lbl_speed.setToolTip("加速实时速率（缓存代理与 GitHub 隧道的上下行）")
+        self.statusBar().addPermanentWidget(self.lbl_speed)
         self.statusBar().showMessage("就绪")
 
     # ---------- 加速中心 ----------
@@ -179,6 +200,23 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         fv.addLayout(btn_row)
         v.addWidget(fast_card)
+
+        # 常驻与速率显示（托盘）
+        c_tray, vt = card("常驻与速率显示")
+        tray_hint = QLabel(
+            "缓存代理与 GitHub 隧道都是本程序提供的服务，想持续加速就得让它继续运行："
+            "勾选后关闭窗口不会退出，而是缩到托盘继续在后台工作。"
+        )
+        tray_hint.setWordWrap(True)
+        tray_hint.setProperty("role", "hint")
+        vt.addWidget(tray_hint)
+        self.chk_close_tray = QCheckBox("关闭窗口时最小化到托盘（加速继续运行）")
+        self.chk_close_tray.toggled.connect(self._on_pref_changed)
+        vt.addWidget(self.chk_close_tray)
+        self.chk_speed_bar = QCheckBox("显示速率悬浮条（停在任务栏上方，实时显示 ↓/↑ 速率）")
+        self.chk_speed_bar.toggled.connect(self._on_pref_changed)
+        vt.addWidget(self.chk_speed_bar)
+        v.addWidget(c_tray)
 
         # 测速卡
         speed_card, sv = card("镜像源测速")
@@ -314,6 +352,7 @@ class MainWindow(QMainWindow):
         if not running:
             # 记住用户原本的源，停止代理时才能精确还原
             self._prev_registry = npm_manager.raw_registry()
+            npm_manager.save_proxy_state(self._prev_registry)   # 崩溃/强杀后也能精确还原
             npm_manager.backup_npmrc()
         self.proxy_thread = self._keep(ProxyActionThread("stop" if running else "start", parent=self))
         self.proxy_thread.finished_sig.connect(self._on_proxy_toggled)
@@ -332,6 +371,7 @@ class MainWindow(QMainWindow):
             self._log("已把 npm 源指向本地代理，安装时元数据与 tarball 都会走本地缓存。")
         else:
             npm_manager.restore_registry(self._prev_registry)
+            npm_manager.clear_proxy_state()
             self.btn_proxy_toggle.setText("启动本地代理")
             self._log(f"代理已停止，npm 源恢复为 {npm_manager.current_registry()}")
         self.refresh_registry_list()
@@ -627,8 +667,12 @@ class MainWindow(QMainWindow):
             return
         if proxy_server.proxy_stats()["running"]:
             return
-        fallback = self._registry_from_backup() or "https://registry.npmmirror.com"
+        if _port_alive(proxy_server.PROXY_PORT):
+            return   # 另一个实例正在提供代理，别动用户的源
+        remembered = npm_manager.load_proxy_state()
+        fallback = remembered or self._registry_from_backup() or "https://registry.npmmirror.com"
         npm_manager.restore_registry(fallback)
+        npm_manager.clear_proxy_state()
         self._log(f"检测到上次退出遗留的本地代理源，已自动恢复为 {fallback}")
 
     @staticmethod
@@ -656,10 +700,38 @@ class MainWindow(QMainWindow):
             self._log(f"已把 npm 源恢复为 {npm_manager.current_registry()}")
 
     def closeEvent(self, event):
-        """退出前收敛后台工作：终止命令、等线程收尾、停代理并还原源。
+        """关闭窗口：按用户偏好「最小化到托盘」或真正退出。
 
-        不等线程结束就退出会让进程带着运行中的 QThread 走向 abort（闪退）。
+        最小化到托盘时**不动任何代理**（加速继续跑），这才是常驻的意义；真正退出前才
+        收敛后台工作：终止命令、等线程收尾、停两个代理、还原所有被改过的配置。
         """
+        if self._quitting or not self.close_to_tray:
+            self._cleanup_and_quit()
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        if not tray.tray_hint_shown():
+            self.tray.notify("已最小化到托盘（加速继续运行）",
+                             "右键托盘图标可显示主窗口或退出。")
+            tray.mark_tray_hint_shown()
+        self._log("窗口已最小化到托盘，加速仍在后台运行；右键托盘图标可退出。")
+
+    def request_quit(self):
+        """真正退出（托盘菜单的「退出」走这里）。"""
+        self._quitting = True
+        self.close()
+
+    def show_main_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _cleanup_and_quit(self):
+        """退出前的收尾（不等线程结束就退出会让进程带着 QThread 走向 abort）。"""
+        for timer in (self.stat_timer, self.github_timer, self.github_speed_timer,
+                      self.speed_timer):
+            timer.stop()
         if self.cmd_thread is not None and self.cmd_thread.isRunning():
             self.cmd_thread.stop()
         for thread in list(self._jobs):
@@ -670,7 +742,113 @@ class MainWindow(QMainWindow):
         if github_boost.github_stats()["running"]:
             github_boost.stop_proxy()
         self._restore_registry_if_proxied()
-        event.accept()
+        self._restore_git_proxy_if_ours()
+        self.speed_bar.hide()
+        self.tray.hide()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()   # 关掉了「最后窗口关闭即退出」，所以这里要显式退出事件循环
+
+    def _restore_git_proxy_if_ours(self):
+        """退出前把「指向本机加速代理」的 git 配置还原。
+
+        否则软件一关，git 还指着已停止的代理，之后 clone / pull / push 全部连不上。
+        """
+        if not github_boost.git_proxy_status()["points_to_us"]:
+            return
+        ok, msg = github_boost.restore_git_proxy()
+        self._log(f"退出前已还原 git 的 GitHub 代理配置（{msg}）" if ok
+                  else f"⚠ 还原 git 配置失败：{msg}")
+
+    def _repair_dangling_git_proxy(self):
+        """开机自愈：git 指向本机加速代理、但该代理确实没在跑（上次异常退出）→ 还原。"""
+        if not github_boost.git_proxy_status()["points_to_us"]:
+            return
+        if github_boost.github_stats()["running"] or _port_alive(github_boost.PROXY_PORT):
+            return   # 本进程或另一个实例正在提供加速，别动它
+        ok, _msg = github_boost.restore_git_proxy()
+        if ok:
+            self._log("检测到 git 的 GitHub 代理指向已停止的本地加速，已自动还原。")
+
+    # ---------- 托盘常驻与速率显示 ----------
+    def _init_tray_and_meter(self):
+        self.meter = speed_meter.RateMeter()
+        self.speed_bar = tray.SpeedBar()
+        self.speed_bar.show_main_requested.connect(self.show_main_window)
+
+        self.tray = tray.TrayController(parent=self)
+        self.tray.show_requested.connect(self.show_main_window)
+        self.tray.quit_requested.connect(self.request_quit)
+        self.tray.speed_bar_toggled.connect(self._on_tray_bar_toggled)
+        self.tray.close_to_tray_toggled.connect(self._on_tray_close_toggled)
+
+        store = tray.settings()
+        for checkbox, key, default in ((self.chk_close_tray, tray.CLOSE_TO_TRAY_KEY, True),
+                                       (self.chk_speed_bar, tray.SPEED_BAR_KEY, False)):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(store.value(key, default, type=bool)))
+            checkbox.blockSignals(False)
+        if not self.tray.available:
+            # 没有托盘时若还最小化，窗口就再也叫不出来了 —— 强制改成直接退出
+            self.chk_close_tray.setChecked(False)
+            self.chk_close_tray.setEnabled(False)
+            self.chk_close_tray.setToolTip("当前系统没有可用的通知区域（托盘），关闭窗口将直接退出。")
+        self._on_pref_changed()
+
+        self.speed_timer = QTimer(self)
+        self.speed_timer.timeout.connect(self.refresh_speed)
+        self.speed_timer.start(1000)
+        self.refresh_speed()
+
+    def refresh_speed(self):
+        """每秒采样一次，刷新状态栏、悬浮条与托盘提示。"""
+        snap = self.meter.sample()
+        status = self._accel_status_text()
+        self.lbl_speed.setText(f"↓ {snap['down_text']}   ↑ {snap['up_text']}")
+        self.lbl_speed.setToolTip(
+            f"加速实时速率（{snap['state_text']}）\n"
+            f"本次累计 ↓ {speed_meter.format_bytes(snap['session_down'])}"
+            f" · ↑ {speed_meter.format_bytes(snap['session_up'])}\n"
+            f"{status}")
+        self.speed_bar.set_snapshot(snap, status)
+        self.tray.update_status(snap, status)
+
+    def _accel_status_text(self) -> str:
+        parts = []
+        if proxy_server.proxy_stats()["running"]:
+            parts.append("缓存代理运行中")
+        if github_boost.github_stats()["running"]:
+            parts.append("GitHub 隧道运行中")
+        return " · ".join(parts) if parts else "加速未启动"
+
+    def _on_pref_changed(self):
+        """两个常驻偏好变化后统一落地（界面勾选框与托盘菜单双向同步）。"""
+        self.close_to_tray = self.chk_close_tray.isChecked()
+        tray.settings().setValue(tray.CLOSE_TO_TRAY_KEY, self.close_to_tray)
+        show_bar = self.chk_speed_bar.isChecked()
+        tray.settings().setValue(tray.SPEED_BAR_KEY, show_bar)
+        self.speed_bar.setVisible(show_bar)
+        if show_bar:
+            self.speed_bar.restore_position()
+        self._sync_tray_actions()
+
+    def _on_tray_bar_toggled(self, on: bool):
+        self.chk_speed_bar.setChecked(bool(on))     # 触发 toggled → _on_pref_changed
+
+    def _on_tray_close_toggled(self, on: bool):
+        self.chk_close_tray.setChecked(bool(on))
+
+    def _sync_tray_actions(self):
+        """把界面勾选状态同步到托盘菜单（先屏蔽信号，避免来回触发）。"""
+        if self.tray.icon is None:
+            return
+        pairs = ((self.tray.act_close, self.chk_close_tray.isChecked()),
+                 (self.tray.act_bar, self.chk_speed_bar.isChecked()))
+        for action, value in pairs:
+            if action.isChecked() != value:
+                action.blockSignals(True)
+                action.setChecked(value)
+                action.blockSignals(False)
 
     # ---------- GitHub 加速 ----------
     def _tab_github(self):

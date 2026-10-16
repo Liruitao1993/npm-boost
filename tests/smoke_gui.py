@@ -34,7 +34,12 @@ from PySide6.QtGui import QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import theme  # noqa: E402
+import proxy_server  # noqa: E402
 import version  # noqa: E402
+
+# 托盘的常驻偏好也换到临时 ini：QSettings(org, app) 默认写注册表，setDefaultFormat 对它无效
+import tray  # noqa: E402
+tray.settings = lambda: QSettings(str(tmp / "tray.ini"), QSettings.Format.IniFormat)
 
 failures = []
 t0 = time.time()
@@ -150,7 +155,45 @@ try:
         print(f"[{time.time()-t0:.1f}s] 测速结果:\n{text}")
         check("测速已返回结果", "测速中" not in text and bool(text.strip()))
         check("测速按钮已恢复可用", w.btn_speed.isEnabled())
-        w.close()          # 走 closeEvent：等线程、停代理、还原源
+        # ---- 托盘常驻与速率显示 ----
+        check("状态栏有实时速率标签",
+              "↓" in w.lbl_speed.text() and "↑" in w.lbl_speed.text(), w.lbl_speed.text())
+        check("两个常驻偏好勾选框都在",
+              hasattr(w, "chk_close_tray") and hasattr(w, "chk_speed_bar"))
+        check("托盘可用性已探测", isinstance(w.tray.available, bool), str(w.tray.available))
+
+        w.chk_close_tray.setChecked(True)
+        app.processEvents()
+        w.close()                       # 勾了「最小化到托盘」→ 只隐藏窗口，不退出进程
+        app.processEvents()
+        check("关闭窗口 = 最小化到托盘（窗口隐藏、进程仍在）",
+              (not w.isVisible()) and not w._quitting)
+        w.show_main_window()
+        app.processEvents()
+        check("从托盘可以叫回主窗口", w.isVisible())
+
+        w.chk_speed_bar.setChecked(True)
+        app.processEvents()
+        bar = w.speed_bar
+        inside = any(s.availableGeometry().contains(bar.frameGeometry()) for s in app.screens())
+        check("速率悬浮条已显示且完整落在工作区内（即任务栏上方）",
+              bar.isVisible() and inside, f"({bar.x()},{bar.y()}) {bar.width()}x{bar.height()}")
+        w.refresh_speed()
+        snap = w.meter.snapshot()
+        check("速率快照字段完整",
+              {"down_text", "up_text", "idle", "state_text", "session_down"} <= set(snap),
+              str(sorted(snap)))
+        check("托盘提示已带上速率",
+              w.tray.icon is None or "B/s" in w.tray.icon.toolTip()
+              or "MB/s" in w.tray.icon.toolTip(),
+              "" if w.tray.icon is None else w.tray.icon.toolTip().replace("\n", " | "))
+
+        w.request_quit()                # 真正退出：停代理、还原配置、隐藏托盘
+        app.processEvents()
+        check("退出时收尾：两个代理都已停止",
+              not proxy_server.proxy_stats()["running"]
+              and not github_boost.github_stats()["running"])
+        check("退出时隐藏了托盘图标", w.tray.icon is None or not w.tray.icon.isVisible())
         app.quit()
 
     QTimer.singleShot(16000, after_speed)

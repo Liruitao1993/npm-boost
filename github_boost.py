@@ -82,7 +82,8 @@ _state = {
     "thread": None,
     "ip_map": {},          # host -> {"ips": [...], "detail": [...], "updated": ts}
     "stats": {"tunnels": 0, "hits": 0, "fallbacks": 0, "failed": 0,
-              "bytes": 0, "last_connect": "", "last_error": ""},
+              "bytes": 0, "bytes_down": 0, "bytes_up": 0,
+              "last_connect": "", "last_error": ""},
     "ip_failures": {},     # host -> {ip: 连续失败次数}（隧道零响应则记一次，成功即清零）
     "log": [],
 }
@@ -368,20 +369,22 @@ class _RelayBytes(int):
     raw.githubusercontent.com 就有这种 IP）：据此把它标记下来，下次换别的候选。
     """
 
-    def __new__(cls, total: int, from_upstream: int = 0):
+    def __new__(cls, total: int, from_upstream: int = 0, from_client: int = 0):
         obj = super().__new__(cls, total)
         obj.from_upstream = from_upstream
+        obj.from_client = from_client
         return obj
 
 
 def _relay(client: socket.socket, upstream: socket.socket, idle: float = RELAY_IDLE) -> _RelayBytes:
     """双向转发；任一端 EOF 只做半关闭，让另一端把剩余数据读完。
 
-    返回转发总字节数（int 子类 _RelayBytes，附带 from_upstream）。
+    返回转发总字节数（int 子类 _RelayBytes，附带 from_upstream / from_client）。
     """
     remaining = [client, upstream]
     total = 0
     from_upstream = 0
+    from_client = 0
     last = time.time()
     while remaining:
         try:
@@ -412,11 +415,13 @@ def _relay(client: socket.socket, upstream: socket.socket, idle: float = RELAY_I
                 break
             total += len(data)
             if src is upstream:
-                from_upstream += len(data)
+                from_upstream += len(data)   # 上游→客户端：下载
+            else:
+                from_client += len(data)     # 客户端→上游：上传（如 git push）
             last = time.time()
         if time.time() - last > idle:
             break
-    return _RelayBytes(total, from_upstream)
+    return _RelayBytes(total, from_upstream, from_client)
 
 
 class _TunnelHandler(BaseHTTPRequestHandler):
@@ -498,6 +503,8 @@ class _TunnelHandler(BaseHTTPRequestHandler):
             moved = _relay(self.connection, upstream)
             with _lock:
                 _state["stats"]["bytes"] += moved
+                _state["stats"]["bytes_down"] += getattr(moved, "from_upstream", 0)
+                _state["stats"]["bytes_up"] += getattr(moved, "from_client", 0)
         finally:
             try:
                 upstream.close()
@@ -537,6 +544,8 @@ class _TunnelHandler(BaseHTTPRequestHandler):
             moved = _relay(self.connection, upstream)
             with _lock:
                 _state["stats"]["bytes"] += moved
+                _state["stats"]["bytes_down"] += getattr(moved, "from_upstream", 0)
+                _state["stats"]["bytes_up"] += getattr(moved, "from_client", 0)
         finally:
             try:
                 upstream.close()
@@ -619,6 +628,8 @@ def github_stats() -> dict:
             "fallbacks": stats["fallbacks"],
             "failed": stats["failed"],
             "bytes": stats["bytes"],
+            "bytes_down": stats["bytes_down"],   # 上游→客户端（下载）
+            "bytes_up": stats["bytes_up"],       # 客户端→上游（上传，如 git push）
             "last_connect": stats["last_connect"],
             "last_error": stats["last_error"],
             "hosts_ready": sum(1 for e in _state["ip_map"].values() if e.get("ips")),

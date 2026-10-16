@@ -116,6 +116,21 @@ check("截断时文案带 ≥ 与「未统计完」", truncated.startswith("≥ 
       truncated)
 check("format_size(用户缓存真实体积) -> 644.6 MB",
       npm_manager.format_size(675915216) == "644.6 MB", npm_manager.format_size(675915216))
+print("8) 代理运行状态记录（崩溃/强杀后精确还原）")
+npm_manager.PROXY_STATE_PATH = tmp / "proxy-state.json"
+check("没有记录时返回 None", npm_manager.load_proxy_state() is None)
+npm_manager.save_proxy_state("https://registry.npmmirror.com")
+check("保存后能读回", npm_manager.load_proxy_state() == "https://registry.npmmirror.com",
+      str(npm_manager.load_proxy_state()))
+npm_manager.save_proxy_state(None)
+check("原本没配 registry（None）时读回 None", npm_manager.load_proxy_state() is None)
+npm_manager.PROXY_STATE_PATH.write_text("{ 坏掉的 json", encoding="utf-8")
+check("文件损坏时返回 None 而不是抛异常", npm_manager.load_proxy_state() is None)
+npm_manager.clear_proxy_state()
+check("clear 之后记录文件被删除", not npm_manager.PROXY_STATE_PATH.exists())
+check("状态文件沿用用户主目录下的固定名",
+      npm_manager.PROXY_STATE_PATH.name == "proxy-state.json")
+
 print()
 print("结果:", "全部通过" if not failures else f"失败 {len(failures)} 项 {failures}")
 sys.exit(1 if failures else 0)

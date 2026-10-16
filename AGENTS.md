@@ -26,6 +26,8 @@ main_window.py    # 主窗口，6 个标签页（加速中心/镜像源/本地�
 npm_manager.py    # .npmrc 读写、镜像源列表、测速、npm 命令执行（纯函数为主）
 proxy_server.py   # 本地 HTTP 缓存代理 127.0.0.1:8046（线程式 ThreadingHTTPServer）
 github_boost.py   # GitHub 加速 127.0.0.1:8047（DoH 优选 IP + CONNECT 隧道，不做 TLS 中间人）
+speed_meter.py    # 速率聚合：两个代理的累计字节 → 实时 ↓/↑（滑动平均 + 空闲判定，纯后端）
+tray.py           # 托盘常驻 + 速率悬浮条（图标代码绘制；QSettings 记偏好与位置）
 workers.py        # QThread 后台线程：测速/命令执行/环境采集/代理操作
 theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯一配色来源）
 启动NPM加速器.bat  # 开发态启动脚本
@@ -104,6 +106,27 @@ theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯�
   `~/.npm-boost-git-proxy.json` 且只备份一次，还原时按备份恢复原值而不是无脑删除。
   注意 `git config --global --get <key>` 才是读（写成 `get` 会被 git 当成键名报 rc=2）。
 - GitHub 加速页的定时器：状态 2s 轻量刷新（只读内存，不跑子进程），优选 IP 每 10 分钟自动重测。
+- **托盘常驻的三条硬约束**：① `main.py` 必须 `setQuitOnLastWindowClosed(False)`，否则收起到托盘后进程会
+  退出；② 真正退出统一走 `MainWindow._cleanup_and_quit()`（显式 `app.quit()`），`closeEvent` 只负责
+  「隐藏还是退出」的分叉；③ 没有系统托盘时（`QSystemTrayIcon.isSystemTrayAvailable()` 为假）强制
+  「关闭即退出」，不然窗口就再也叫不回来了。
+- **速率必须来自真实字节、而且必须边传边计**：`proxy_server` 用 `_copy_counting()` 与回源下载循环
+  **逐块** `_count_down()`（未命中计「上游→本地」，命中计「本地→客户端」，同一次安装不重复计）；
+  `github_boost._relay()` 双向计数（`_RelayBytes.from_upstream/from_client`）→ `speed_meter.RateMeter`
+  1 秒采样 + 3 点滑动平均、5 秒无流量算空闲。**别改成"整段传完再累加一次"**：实测那样长下载会中途
+  一直显示 0、末尾跳一个"突发均值"，用户看不到实时速率。npm 的 GET 请求体由 requests 内部生成且极小，
+  不计入上传，免得报出虚高数字。
+- **代理状态落盘**：启动本地代理前把用户原本的 registry 写进 `~/.npm-accelerator-state.json`
+  （`npm_manager.save_proxy_state()`），崩溃/强杀后自愈时优先用它还原。只靠 `~/.npmrc.bak` 会还原成
+  很久以前的源（实测踩过：用户的 npmmirror 被还原成了备份里的腾讯云）。
+- **测试里的 QSettings 必须显式隔离**：`QSettings(org, app)` 默认写注册表，且 `QSettings.setDefaultFormat`
+  对它**无效**（踩过坑：测试真的写进了用户注册表）。测试要 monkeypatch `tray.settings` 指向临时 ini。
+- **退出与启动都要管住 git 代理键**：退出前 `_restore_git_proxy_if_ours()`；启动时
+  `_repair_dangling_git_proxy()`（先用 `_port_alive(8047)` 确认没有别的实例在提供加速，否则会误改）。
+  npm registry 的开机自愈也补了同样的端口判断。
+- **托盘/窗口图标用 `tray.make_icon()` 代码绘制**（颜色取自 `theme.palette()`），exe 不依赖图标文件；
+  悬浮条样式在 theme.py 的 QSS（`#speedBar` / `#speedDot[state]` / `#speedStatus`），组件里不要写色值。
+
 ## 测试方式
 
 ```bash
@@ -131,7 +154,10 @@ theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯�
 # 8) GitHub 加速真实端到端（需联网：curl 与 git 经本地加速代理拉取，并核对确实走了优选 IP）
 "D:\Program Files\Python313\python.exe" tests\verify_github_boost.py
 
-# 9) 打包后的 exe 自检（结果见 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
+# 9) 托盘常驻与速率显示（真实托盘/悬浮条：关闭行为、默认位置、速率文案与偏好持久化）
+"D:\Program Files\Python313\python.exe" tests\test_tray.py
+
+# 10) 打包后的 exe 自检（结果见 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
 dist\NPM加速器.exe --selftest
 ```
 

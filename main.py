@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from main_window import MainWindow
 from theme import ThemeManager
+import tray
 import version
 
 SELFTEST_FLAG = "--selftest"
@@ -152,6 +153,9 @@ def main():
     app.setApplicationName("NPM 加速器")
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei UI", 10))
+    # 托盘常驻：窗口收起（最小化到托盘）时进程要活着，所以不能「最后窗口关闭即退出」
+    app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(tray.make_icon())
     # 主题：默认跟随系统，用户的选择持久化在 QSettings（切换与跟随由 ThemeManager 负责）
     theme_manager = ThemeManager(app=app)
     win = MainWindow(theme_manager)

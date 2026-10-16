@@ -5,7 +5,7 @@
     VERSION / BUILD_DATE / BUILD_STAMP
 源码直接运行时没有这个文件，标题里就显示「源码运行」而不是伪造一个构建日期。
 """
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "NPM 加速器"
 PROJECT_NAME = "npm-boost"
 AUTHOR = "liruitao"

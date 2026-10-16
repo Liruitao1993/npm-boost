@@ -282,6 +282,18 @@ QToolTip {
     background: $tooltip_bg; color: $tooltip_text;
     border: 1px solid $border_strong; padding: 4px 6px;
 }
+
+/* 速率悬浮条（托盘常驻时的实时速率显示） */
+QWidget#speedBar {
+    background-color: $surface;
+    border: 1px solid $border_strong;
+    border-radius: 9px;
+}
+QLabel#speedDown { color: $stat_text; font-weight: 700; background: transparent; }
+QLabel#speedUp { color: $text_muted; font-weight: 600; background: transparent; }
+QLabel#speedDot { color: $text_disabled; background: transparent; }
+QLabel#speedDot[state="active"] { color: $primary; }
+QLabel#speedStatus { color: $stat_text; font-weight: 700; }
 """)
 
 

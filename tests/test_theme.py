@@ -123,7 +123,8 @@ check("QPalette.Base 用输入框底色",
 
 print("5) 组件里不得再出现硬编码色值")
 color_pattern = re.compile(r"#[0-9a-fA-F]{6}\b")
-for name in ("main.py", "main_window.py", "workers.py", "npm_manager.py", "proxy_server.py"):
+for name in ("main.py", "main_window.py", "workers.py", "npm_manager.py", "proxy_server.py",
+             "tray.py", "speed_meter.py"):
     text = (ROOT / name).read_text(encoding="utf-8")
     hits = color_pattern.findall(text)
     check(f"{name} 无硬编码色值", not hits, str(hits[:3]))

@@ -51,6 +51,7 @@ _state = {
     "hits": 0,          # 缓存命中次数
     "misses": 0,        # 缓存未命中次数
     "bytes_saved": 0,   # 命中省下的下载字节数
+    "bytes_down": 0,    # 写给客户端的内容字节数（速率表用它算下载速率）
     "rewrites": 0,      # 改写过的 tarball 地址数
     "log": [],
 }
@@ -84,9 +85,39 @@ def proxy_stats() -> dict:
             "misses": misses,
             "hit_rate": f"{hits / total * 100:.0f}%" if total else "—",
             "bytes_saved": _state["bytes_saved"],
+            "bytes_down": _state["bytes_down"],   # 真正写给客户端的内容字节（速率表用它）
             "rewrites": _state["rewrites"],
             "log": list(_state["log"][-100:]),
         }
+
+
+def _count_down(num_bytes: int) -> None:
+    """累加写给客户端的内容字节数（缓存命中与回源都算）。
+
+    速率表用它换算「下载速率」：命中虽然不走上游，但用户看到的下载速度就是它，
+    所以一样计入（省下的上游流量另有 bytes_saved 单独统计）。
+    """
+    if num_bytes > 0:
+        with _lock:
+            _state["bytes_down"] += num_bytes
+
+
+def _copy_counting(src, dst, chunk: int = _CHUNK, count: bool = True) -> int:
+    """把内容写给客户端，并**按块**累计字节数（count=False 表示这段已经计过）。
+
+    必须按块计数：速率表每 1 秒采一次样，如果等整个响应写完再一次性累加，
+    长时间下载会中途一直显示 0、结束时跳一个"突发均值"，用户看不到真实速率。
+    """
+    moved = 0
+    while True:
+        piece = src.read(chunk)
+        if not piece:
+            break
+        dst.write(piece)
+        moved += len(piece)
+        if count:
+            _count_down(len(piece))
+    return moved
 
 
 def _log(msg: str) -> None:
@@ -101,6 +132,7 @@ def reset_stats() -> None:
         _state["hits"] = 0
         _state["misses"] = 0
         _state["bytes_saved"] = 0
+        _state["bytes_down"] = 0
         _state["rewrites"] = 0
 
 
@@ -253,7 +285,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             if not head_only:
                 with open(cpath, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile, _CHUNK)
+                    _copy_counting(f, self.wfile)
         except OSError:
             pass
         _log(f"缓存命中 {self.path[:70]} ({size // 1024} KB)")
@@ -291,7 +323,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Cache", "MISS")
                 self.end_headers()
                 if not head_only and raw:
-                    self.wfile.write(raw)
+                    _count_down(len(raw))   # 这是刚从上游读到的量 = 真实网络下载
+                    for start in range(0, len(raw), _CHUNK):
+                        self.wfile.write(raw[start:start + _CHUNK])
                 _log(f"回源(透传 {encoding}) {self.path[:60]} -> {resp.status_code}")
                 return
 
@@ -304,6 +338,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if chunk:
                         f.write(chunk)
                         total += len(chunk)
+                        _count_down(len(chunk))   # 上游→本地，这才是真实网络下载量
 
             content_type = resp.headers.get("Content-Type", "")
             cacheable = resp.status_code == 200 and not range_header and total > 0
@@ -345,7 +380,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _log(f"回源 {self.path[:70]} -> {resp.status_code} ({total // 1024} KB)")
             if not head_only and total:
                 with open(body_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile, _CHUNK)
+                    _copy_counting(f, self.wfile, count=False)   # 回源那一段已经计过网络下载量
         except OSError as e:
             _log(f"传输中断 {self.path[:60]}: {str(e)[:60]}")
         finally:
@@ -515,8 +550,9 @@ def self_test() -> dict:
                    and tb_first == tb_second == tarball_body
                    and st["hits"] >= 2
                    and counts["meta"] == 1
-                   and counts["tarball"] == 1),
-            "hits": st["hits"], "misses": st["misses"],
+                   and counts["tarball"] == 1
+                   and st["bytes_down"] >= len(first) + len(tb_first)),
+            "hits": st["hits"], "misses": st["misses"], "bytes_down": st["bytes_down"],
             "upstream_meta_requests": counts["meta"],
             "upstream_tarball_requests": counts["tarball"],
             "tarball_rewritten_to": tarball_url,

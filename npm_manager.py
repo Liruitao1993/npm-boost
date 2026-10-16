@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """npm 配置管理后端：读写 .npmrc、镜像源管理、测速、npm 命令执行。"""
+import json
 import os
 import shutil
 import subprocess
@@ -388,3 +389,36 @@ def verify_cache(callback=None) -> None:
         if callback:
             callback()
     threading.Thread(target=worker, daemon=True).start()
+
+
+# ================= 代理运行状态（崩溃后精确还原用） =================
+# 备份 ~/.npmrc.bak 是「很多轮操作之前」的快照，拿它还原可能恢复到很旧的源；
+# 这里在启动代理前把「此刻用户原本的源」单独记一份，崩溃/强杀后也能精确还原。
+PROXY_STATE_PATH = Path.home() / ".npm-accelerator-state.json"
+
+
+def save_proxy_state(registry) -> None:
+    """启动本地代理前调用：记下用户原本的 registry。"""
+    try:
+        PROXY_STATE_PATH.write_text(
+            json.dumps({"previous_registry": registry}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_proxy_state():
+    """读取上次启动代理前记下的 registry；文件不存在或损坏时返回 None。"""
+    try:
+        data = json.loads(PROXY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("previous_registry")
+    return value if isinstance(value, str) and value else None
+
+
+def clear_proxy_state() -> None:
+    """代理正常停止（或已按状态还原）后清掉这份记录。"""
+    try:
+        PROXY_STATE_PATH.unlink()
+    except OSError:
+        pass
