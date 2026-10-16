@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
-"""主窗口：加速中心 / 镜像源 / 本地缓存代理 / 项目助手 / 日志。"""
+"""主窗口：加速中心 / 镜像源 / 本地缓存代理 / GitHub 加速 / 项目助手 / 日志。"""
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QRadioButton, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QStatusBar, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
+import github_boost
 import npm_manager
 import proxy_server
 import theme
 import version
-from workers import EnvInfoThread, NpmCommandThread, ProxyActionThread, SpeedTestThread
+from workers import (EnvInfoThread, GithubActionThread, GithubSpeedThread,
+                     NpmCommandThread, ProxyActionThread, SpeedTestThread)
 
 
 def card(title: str = None) -> tuple:
@@ -56,11 +59,23 @@ class MainWindow(QMainWindow):
         self._repair_dangling_proxy_registry()
         self.refresh_env()
         self.refresh_proxy_panel()
+        self.refresh_github_panel()
 
         # 代理统计刷新定时器
         self.stat_timer = QTimer(self)
         self.stat_timer.timeout.connect(self.refresh_proxy_stats)
         self.stat_timer.start(2000)
+
+        # GitHub 加速：状态轻量刷新 + 优选 IP 定期重测（GitHub 的 IP 会失效）
+        self.github_thread = None
+        self.github_speed_thread = None
+        self.github_git_thread = None
+        self.github_timer = QTimer(self)
+        self.github_timer.timeout.connect(self.refresh_github_stats)
+        self.github_timer.start(2000)
+        self.github_speed_timer = QTimer(self)
+        self.github_speed_timer.timeout.connect(self._auto_refresh_github)
+        self.github_speed_timer.start(600000)
 
     # ================= UI 构建 =================
     def _build_ui(self):
@@ -75,7 +90,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         t = QLabel("NPM 加速器")
         t.setObjectName("appTitle")
-        st = QLabel("一键加速 npm 安装：国内镜像 · 本地缓存 · 极速参数")
+        st = QLabel("一键加速 npm 安装与 GitHub 访问：国内镜像 · 本地缓存 · 极速参数 · GitHub 优选 IP")
         st.setObjectName("appSubtitle")
         title_box.addWidget(t)
         title_box.addWidget(st)
@@ -103,6 +118,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._tab_home(), "加速中心")
         self.tabs.addTab(self._tab_registry(), "镜像源")
         self.tabs.addTab(self._tab_proxy(), "本地缓存代理")
+        self.tabs.addTab(self._tab_github(), "GitHub 加速")
         self.tabs.addTab(self._tab_project(), "项目助手")
         self.tabs.addTab(self._tab_log(), "日志")
 
@@ -651,5 +667,222 @@ class MainWindow(QMainWindow):
                 thread.wait(8000)
         if proxy_server.proxy_stats()["running"]:
             proxy_server.stop_proxy()
+        if github_boost.github_stats()["running"]:
+            github_boost.stop_proxy()
         self._restore_registry_if_proxied()
         event.accept()
+
+    # ---------- GitHub 加速 ----------
+    def _tab_github(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        c1, v1 = card("GitHub 加速（DoH 优选 IP + 本地 HTTPS 隧道）")
+        desc = QLabel(
+            "GitHub 打不开、clone 卡住，多半是 DNS 被污染或解析到的 IP 不通。这里用 DoH"
+            "（阿里/腾讯/360）绕开本机 DNS 取候选 IP，逐个做 TCP + TLS 握手实测，"
+            "挑出真正能服务该域名的那个。\n"
+            "只做 TCP 隧道转发，不改证书、不改 hosts：不需要装自签 CA，也不会和 Steam++ 这类"
+            "同样改写 hosts 的工具抢域名，普通用户权限就能跑。"
+        )
+        desc.setWordWrap(True)
+        desc.setProperty("role", "hint")
+        v1.addWidget(desc)
+
+        grow = QHBoxLayout()
+        self.btn_github_toggle = QPushButton("启动 GitHub 加速")
+        self.btn_github_toggle.setObjectName("primaryBtn")
+        self.btn_github_toggle.clicked.connect(self.toggle_github)
+        grow.addWidget(self.btn_github_toggle)
+        self.btn_github_speed = QPushButton("重新测速优选 IP")
+        self.btn_github_speed.clicked.connect(self.refresh_github_ips)
+        grow.addWidget(self.btn_github_speed)
+        self.github_status = QLabel("未启动")
+        self.github_status.setProperty("role", "hint")
+        grow.addWidget(self.github_status)
+        grow.addStretch()
+        v1.addLayout(grow)
+
+        srow = QHBoxLayout()
+        self.lbl_gh_tunnels = QLabel("隧道 0")
+        self.lbl_gh_hits = QLabel("优选命中 0")
+        self.lbl_gh_fallback = QLabel("回退 0")
+        self.lbl_gh_bytes = QLabel("转发 0 MB")
+        self.lbl_gh_last = QLabel("最近：—")
+        for lbl in (self.lbl_gh_tunnels, self.lbl_gh_hits, self.lbl_gh_fallback,
+                    self.lbl_gh_bytes, self.lbl_gh_last):
+            lbl.setProperty("role", "stat")
+            srow.addWidget(lbl)
+        srow.addStretch()
+        v1.addLayout(srow)
+        v.addWidget(c1)
+
+        c2, v2 = card("优选 IP（每个 IP 都验过证书与 HTTP 响应）")
+        self.gh_table = QTableWidget(len(github_boost.GITHUB_HOSTS), 4)
+        self.gh_table.setHorizontalHeaderLabels(["域名", "优选 IP", "握手", "状态"])
+        self.gh_table.verticalHeader().setVisible(False)
+        self.gh_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.gh_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.gh_table.setAlternatingRowColors(False)
+        header = self.gh_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in (1, 2, 3):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.gh_table.setMinimumHeight(220)
+        v2.addWidget(self.gh_table)
+        self.gh_progress = QProgressBar()
+        self.gh_progress.setVisible(False)
+        v2.addWidget(self.gh_progress)
+        hint2 = QLabel(
+            "IP 会随 GitHub 的调度变化，失效时点「重新测速优选 IP」；启动后每 10 分钟自动重测一次。"
+        )
+        hint2.setWordWrap(True)
+        hint2.setProperty("role", "hint")
+        v2.addWidget(hint2)
+        v.addWidget(c2)
+
+        c3, v3 = card("让 git 也走加速（只影响 GitHub 仓库）")
+        gdesc = QLabel(
+            "只给 git 的 GitHub 请求配置代理，其它仓库不受影响；设置前会把 git 原有的代理配置"
+            "备份到 ~/.npm-boost-git-proxy.json，随时可一键还原。"
+        )
+        gdesc.setWordWrap(True)
+        gdesc.setProperty("role", "hint")
+        v3.addWidget(gdesc)
+        gitrow = QHBoxLayout()
+        self.btn_git_apply = QPushButton("为 git 启用加速")
+        self.btn_git_apply.clicked.connect(self.apply_git_proxy_ui)
+        gitrow.addWidget(self.btn_git_apply)
+        self.btn_git_restore = QPushButton("还原 git 配置")
+        self.btn_git_restore.setObjectName("dangerBtn")
+        self.btn_git_restore.clicked.connect(self.restore_git_proxy_ui)
+        gitrow.addWidget(self.btn_git_restore)
+        self.git_status = QLabel("未配置")
+        self.git_status.setProperty("role", "hint")
+        gitrow.addWidget(self.git_status)
+        gitrow.addStretch()
+        v3.addLayout(gitrow)
+        self.git_cmd_hint = QLabel("")
+        self.git_cmd_hint.setWordWrap(True)
+        self.git_cmd_hint.setProperty("role", "hint")
+        v3.addWidget(self.git_cmd_hint)
+        v.addWidget(c3)
+
+        v.addStretch()
+        return w
+
+    def refresh_github_panel(self):
+        st = github_boost.github_stats()
+        self.btn_github_toggle.setText("停止 GitHub 加速" if st["running"] else "启动 GitHub 加速")
+        self.github_status.setText(
+            f"运行中 · 代理 {st['url']} · 优选 {st['hosts_ready']}/{st['hosts_total']} 个域名"
+            if st["running"] else "未启动")
+        self.refresh_github_stats()
+        self._fill_github_table()
+        self._refresh_git_status()
+
+    def refresh_github_stats(self):
+        st = github_boost.github_stats()
+        self.lbl_gh_tunnels.setText(f"隧道 {st['tunnels']}")
+        self.lbl_gh_hits.setText(f"优选命中 {st['hits']}")
+        self.lbl_gh_fallback.setText(f"回退 {st['fallbacks']}")
+        self.lbl_gh_bytes.setText(f"转发 {st['bytes'] / 1024 ** 2:.1f} MB")
+        self.lbl_gh_last.setText(f"最近：{st['last_connect'] or '—'}")
+
+    def _fill_github_table(self):
+        for r, row in enumerate(github_boost.ip_table()):
+            if row["ip"] and row["tls"]:
+                handshake, status = f"{row['ms']:.0f} ms", "可用"
+            elif row["ip"]:
+                handshake, status = "—", "仅 TCP 可用"
+            else:
+                handshake, status = "—", row["note"]
+            for col, text in enumerate((row["host"], row["ip"] or "—", handshake, status)):
+                item = QTableWidgetItem(str(text))
+                item.setToolTip(row["note"] or "尚未测速")
+                self.gh_table.setItem(r, col, item)
+
+    def _refresh_git_status(self):
+        status = github_boost.git_proxy_status()
+        if status["points_to_us"]:
+            self.git_status.setText("已指向本地加速")
+        elif status["configured"]:
+            self.git_status.setText(f"git 用了别的代理：{status['configured']}")
+        else:
+            self.git_status.setText("未配置（git 直连 GitHub）")
+        self.git_cmd_hint.setText(f"等价命令：{github_boost.git_proxy_command()}")
+
+    def _auto_refresh_github(self):
+        running = github_boost.github_stats()["running"]
+        busy = self.github_speed_thread is not None and self.github_speed_thread.isRunning()
+        if running and not busy:
+            self._log("GitHub 优选 IP 定时重测…")
+            self.refresh_github_ips(silent=True)
+
+    def toggle_github(self):
+        running = github_boost.github_stats()["running"]
+        self.btn_github_toggle.setEnabled(False)
+        self.github_thread = self._keep(
+            GithubActionThread("stop" if running else "start", parent=self))
+        self.github_thread.finished_sig.connect(self._on_github_toggled)
+        self.github_thread.start()
+
+    def _on_github_toggled(self, ok, msg):
+        self.btn_github_toggle.setEnabled(True)
+        self._log(msg)
+        if not ok:
+            QMessageBox.warning(self, "GitHub 加速", msg)
+            return
+        self.refresh_github_panel()
+        if github_boost.github_stats()["running"] and github_boost.github_stats()["hosts_ready"] == 0:
+            self.refresh_github_ips()
+
+    def refresh_github_ips(self, silent=False):
+        if self.github_speed_thread is not None and self.github_speed_thread.isRunning():
+            return
+        self.btn_github_speed.setEnabled(False)
+        self.gh_progress.setVisible(True)
+        self.gh_progress.setRange(0, 0)
+        self.github_speed_thread = self._keep(GithubSpeedThread(parent=self))
+        self.github_speed_thread.progress.connect(self._on_github_progress)
+        self.github_speed_thread.finished_sig.connect(self._on_github_ips_ready)
+        if not silent:
+            self._log("开始解析并实测 GitHub 候选 IP…")
+        self.github_speed_thread.start()
+
+    def _on_github_progress(self, done, total, label):
+        if total:
+            self.gh_progress.setRange(0, total)
+            self.gh_progress.setValue(done)
+        self.statusBar().showMessage(f"GitHub 优选 {done}/{total}：{label}", 3000)
+
+    def _on_github_ips_ready(self, summary):
+        self.gh_progress.setVisible(False)
+        self.btn_github_speed.setEnabled(True)
+        if "error" in summary:
+            self._log(f"优选失败：{summary['error']}")
+            QMessageBox.warning(self, "GitHub 加速", f"优选 IP 失败：{summary['error']}")
+        else:
+            ready = sum(1 for entry in summary.values() if entry.get("ips"))
+            self._log(f"优选完成：{ready}/{len(summary)} 个域名可用")
+        self.refresh_github_panel()
+
+    def apply_git_proxy_ui(self):
+        self.btn_git_apply.setEnabled(False)
+        self.github_git_thread = self._keep(GithubActionThread("git_apply", parent=self))
+        self.github_git_thread.finished_sig.connect(self._on_git_proxy_changed)
+        self.github_git_thread.start()
+
+    def restore_git_proxy_ui(self):
+        self.btn_git_restore.setEnabled(False)
+        self.github_git_thread = self._keep(GithubActionThread("git_restore", parent=self))
+        self.github_git_thread.finished_sig.connect(self._on_git_proxy_changed)
+        self.github_git_thread.start()
+
+    def _on_git_proxy_changed(self, ok, msg):
+        self.btn_git_apply.setEnabled(True)
+        self.btn_git_restore.setEnabled(True)
+        self._log(msg if ok else f"git 配置操作失败：{msg}")
+        if not ok:
+            QMessageBox.warning(self, "GitHub 加速", msg)
+        self._refresh_git_status()

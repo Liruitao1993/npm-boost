@@ -95,6 +95,7 @@ def run_selftest() -> int:
     import tempfile
     from pathlib import Path
 
+    import github_boost
     import npm_manager
     import proxy_server
 
@@ -122,6 +123,12 @@ def run_selftest() -> int:
     proxy_result = proxy_server.self_test()
     emit(f"代理缓存自检: {'通过' if proxy_result.get('ok') else '失败'} | {proxy_result.get('msg')}")
     ok = ok and bool(proxy_result.get("ok"))
+
+    # GitHub 优选自检：作为可观测项报告。某些网络环境会整体封锁 GitHub，
+    # 那种情况下本项目其它功能仍然正常，所以不计入整体成败。
+    github_result = github_boost.self_test()
+    emit(f"GitHub 优选自检: {'通过' if github_result.get('ok') else '不可用'} | "
+         f"{github_result.get('msg')}")
     theme_ok, theme_msg = check_theme()
     emit(f"主题自检: {'通过' if theme_ok else '失败'} | {theme_msg}")
     ok = ok and theme_ok

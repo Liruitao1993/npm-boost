@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import npm_manager  # noqa: E402
+import github_boost  # noqa: E402
 
 # ---- 用临时 .npmrc 隔离，绝不写用户真实配置 ----
 tmp = Path(tempfile.mkdtemp(prefix="npm-accel-smoke-"))
@@ -120,7 +121,26 @@ try:
         w.tabs.setCurrentIndex(i)
         app.processEvents()
     check("全部标签页均可切换", w.tabs.currentIndex() == w.tabs.count() - 1)
-    check("页面文案为中文", w.tabs.tabText(0) == "加速中心" and w.tabs.tabText(4) == "日志")
+    expected_tabs = ["加速中心", "镜像源", "本地缓存代理", "GitHub 加速", "项目助手", "日志"]
+    actual_tabs = [w.tabs.tabText(i) for i in range(w.tabs.count())]
+    check("标签页顺序与文案正确", actual_tabs == expected_tabs, str(actual_tabs))
+
+    w.tabs.setCurrentIndex(3)          # GitHub 加速页
+    app.processEvents()
+    gh_status_item = w.gh_table.item(0, 3)
+    check("GitHub 加速页控件齐全",
+          w.gh_table.rowCount() == len(github_boost.GITHUB_HOSTS)
+          and w.gh_table.columnCount() == 4
+          and w.btn_github_toggle.text() == "启动 GitHub 加速"
+          and not w.gh_progress.isVisible(),
+          f"{w.gh_table.rowCount()} 行 x {w.gh_table.columnCount()} 列")
+    check("GitHub 优选表已填内容",
+          gh_status_item is not None
+          and gh_status_item.text() in ("尚未测速", "可用", "仅 TCP 可用", "无可用 IP"),
+          gh_status_item.text() if gh_status_item else "None")
+    check("git 加速状态文案已渲染",
+          bool(w.git_status.text()) and "git config --global" in w.git_cmd_hint.text(),
+          w.git_status.text())
 
     w.tabs.setCurrentIndex(0)
     w.run_speedtest()

@@ -22,9 +22,10 @@
 
 ```
 main.py           # 入口：创建 QApplication，加载深色主题
-main_window.py    # 主窗口，5 个标签页（加速中心/镜像源/本地缓存代理/项目助手/日志）
+main_window.py    # 主窗口，6 个标签页（加速中心/镜像源/本地缓存代理/GitHub 加速/项目助手/日志）
 npm_manager.py    # .npmrc 读写、镜像源列表、测速、npm 命令执行（纯函数为主）
 proxy_server.py   # 本地 HTTP 缓存代理 127.0.0.1:8046（线程式 ThreadingHTTPServer）
+github_boost.py   # GitHub 加速 127.0.0.1:8047（DoH 优选 IP + CONNECT 隧道，不做 TLS 中间人）
 workers.py        # QThread 后台线程：测速/命令执行/环境采集/代理操作
 theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯一配色来源）
 启动NPM加速器.bat  # 开发态启动脚本
@@ -76,13 +77,33 @@ theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯�
   `cacert.pem` 打进 exe，缺了它 exe 里所有 HTTPS 请求报
   `OSError: Could not find a suitable TLS CA certificate bundle` —— 现象是「测速全部失败」
   「代理回源全部 502」，而源码直跑完全正常（很容易误判成网络问题）。
-- `main.py --selftest`：打包后自检（CA 证书包 + 6 家镜像测速 + 代理缓存），结果写
+- `main.py --selftest`：打包后自检（CA 证书包 + 6 家镜像测速 + 代理缓存 + GitHub 优选 IP），结果写
   `%TEMP%\npm-accelerator-selftest.txt`，退出码 0 表示通过；windowed 模式没有 stdout，别再靠 print 判断。
+  其中 GitHub 优选那一项只做报告、不计入整体成败（有些网络整体封锁 GitHub，其它功能仍然正常）。
 - **版本信息只有一处来源**：`version.py` 的 `__version__`（还有作者、项目代号）。编译时由
   `NPM加速器.spec` 生成两个不入库的文件：`build_info.py`（运行时读取 → 窗口标题、自检输出）
   与 `version_info.txt`（写进 exe 的 Windows 文件属性）。发新版只改 `__version__` 再重新编译，
   界面上写的日期永远是「本次编译日期」，不会和源码里的固定字符串脱节。
+- **raw.githubusercontent.com 的 185.199.1xx.133 时通时断是正常的**（本机实测同一批 IP 几分钟内从
+  `HTTP 301` 变成全体 TCP 超时）：`probe()` 会把它们剔掉、`--selftest` 的 GitHub 项因此只作报告，
+  别把这种波动当成代码回归去查。
 
+- **GitHub 加速不做 TLS 中间人**：本地只开 CONNECT 隧道转发字节，SNI 与证书仍由客户端与 GitHub
+  直接协商。因此**不需要**自签 CA、**不需要**让 git 关 `http.sslverify`。改这里别退化成中间人实现。
+- **优选 IP 必须三重确认**：TCP 能连 + TLS 握手成功（SNI=域名、校验证书）+ 服务端回了 HTTP 响应，
+  三者都过才算可用。只测 TCP 会把「443 通但证书不匹配」的 IP 选进来，客户端握手必失败。
+- **DoH 只用阿里/腾讯/360**：本机实测 Cloudflare（cloudflare-dns.com）与 Google（dns.google）被阻断，
+  加进 `DOH_PROVIDERS` 只会白白拖慢解析。
+- **别用系统 DNS 解析 GitHub 域名**：本机 hosts 通常已被 Steam++ 这类工具指向 `127.0.0.1`，
+  所以 `resolve_candidates()` 走 DoH、隧道用优选 IP；`is_github_host()` 必须按「`.后缀`」严格匹配，
+  否则 `notgithub.com` / `github.com.evil.com` 会被误加速。
+- **上游零响应要能自愈**：`_relay()` 返回 `_RelayBytes`（带 `from_upstream`），隧道结束后
+  `_judge_tunnel()` 对「一个字节都没回」的 IP 记一次失败，`_candidate_ips()` 据此把失败 IP 排后、
+  连续两次失败暂时不用（全部失败过则原样返回，避免彻底不可用）。
+- **git 配置只碰 GitHub 的键**（`http.https://github.com.proxy` / gist），设置前把原值备份到
+  `~/.npm-boost-git-proxy.json` 且只备份一次，还原时按备份恢复原值而不是无脑删除。
+  注意 `git config --global --get <key>` 才是读（写成 `get` 会被 git 当成键名报 rc=2）。
+- GitHub 加速页的定时器：状态 2s 轻量刷新（只读内存，不跑子进程），优选 IP 每 10 分钟自动重测。
 ## 测试方式
 
 ```bash
@@ -104,7 +125,13 @@ theme.py          # 浅色/深色调色板 + QSS 模板 + 主题管理器（唯�
 # 6) 真实安装端到端（需联网，隔离临时缓存目录）
 "D:\Program Files\Python313\python.exe" tests\verify_proxy_install.py
 
-# 7) 打包后的 exe 自检（结果见 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
+# 7) GitHub 加速离线回归（域名判定 / DoH 解析 / CONNECT 隧道 / IP 失败轮换 / git 配置还原）
+"D:\Program Files\Python313\python.exe" tests\test_github_boost.py
+
+# 8) GitHub 加速真实端到端（需联网：curl 与 git 经本地加速代理拉取，并核对确实走了优选 IP）
+"D:\Program Files\Python313\python.exe" tests\verify_github_boost.py
+
+# 9) 打包后的 exe 自检（结果见 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
 dist\NPM加速器.exe --selftest
 ```
 

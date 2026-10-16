@@ -2,11 +2,11 @@
 
 # ⚡ NPM 加速器
 
-**让每一次 `npm install` 都快人一步**
+**让每一次 `npm install` 都快人一步，也让 GitHub 不再打不开**
 
-基于 PySide6 的 Windows 桌面工具 · 国内镜像 · 本地缓存代理 · 极速参数 · 浅色/深色主题 · 全中文界面
+基于 PySide6 的 Windows 桌面工具 · 国内镜像 · 本地缓存代理 · 极速参数 · **GitHub 加速** · 浅色/深色主题 · 全中文界面
 
-**当前版本 v1.0.0** · 作者 **liruitao** · 项目代号 `npm-boost`
+**当前版本 v1.1.0** · 作者 **liruitao** · 项目代号 `npm-boost`
 窗口标题会带上版本号、编译日期与作者；exe 上「右键 → 属性 → 详细信息」里也能看到。
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows11&logoColor=white)
@@ -28,6 +28,7 @@
 | 每次 `install` 都重复下载相同的包 | **本地缓存代理**：同版本包第二次安装秒取本地磁盘 |
 | `audit` / `fund` 安全检查拖慢收尾 | 极速参数预置：高并发 + 跳过冗余检查 |
 | 不知道哪个镜像源最快 | 并发测速 6 大镜像源，自动推荐最优 |
+| GitHub 打不开、`git clone` / `git pull` 卡住 | **GitHub 加速**：DoH 优选最快 IP + 本地隧道，绕开被污染的 DNS |
 
 ## 🚀 快速开始
 
@@ -82,6 +83,23 @@ npm install ──▶ 127.0.0.1:8046 ──▶ 首次：回源下载 + 写入缓
   边车文件（记录 Content-Type / ETag）
 - `~/.npmrc` 只做「按键最小改动」写入：注释、空行、键顺序、私有源鉴权行都会原样保留
 
+### 🐙 GitHub 加速
+
+```text
+curl / git / 浏览器 ──▶ 127.0.0.1:8047 ──▶ DoH 优选出的最快 IP ──▶ GitHub
+                              │
+                              └─ 只转发字节：证书与 SNI 仍是 GitHub 的（无需装自签 CA）
+```
+
+- **绕开被污染的 DNS**：用阿里 / 腾讯 / 360 的 DoH 解析候选 IP，不读本机 hosts 与运营商 DNS
+- **三重确认才采用**：TCP 能连 + TLS 握手成功且**证书就是该域名的** + 服务端真的回了 HTTP 响应
+- **16 个域名**：github.com / api / codeload / raw / objects / 头像 / gist / GitHub Pages …
+- **一键让 git 走加速**：只给 git 的 GitHub 请求配置代理（其它仓库不受影响）；设置前会把原有代理配置
+  备份到 `~/.npm-boost-git-proxy.json`，随时一键还原
+- **不改证书、不改 hosts、不需要管理员权限**，也不会和 Steam++ 这类同样改写 hosts 的工具抢域名
+- 界面实时显示每个域名的优选 IP 与握手耗时；IP 失效时可手动重测，启动后每 10 分钟自动重测
+- 某个 IP 连得上却一个字节都不回时会被自动标记，后续连接优先换用其它候选
+
 ### 📁 项目助手
 
 选择任意含 `package.json` 的目录，直接运行 `npm install / ci / update` 或自定义命令，输出实时滚动，可随时终止。
@@ -127,9 +145,10 @@ NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node/
 ```text
 npm加速器/
 ├── main.py               # 程序入口
-├── main_window.py        # 主窗口 · 5 个功能页
+├── main_window.py        # 主窗口 · 6 个功能页
 ├── npm_manager.py        # .npmrc 读写 · 镜像列表 · 测速 · npm 命令
 ├── proxy_server.py       # 本地 HTTP 缓存代理（线程式）
+├── github_boost.py       # GitHub 加速：DoH 优选 IP + 本地 CONNECT 隧道代理
 ├── workers.py            # QThread 后台线程
 ├── theme.py              # 浅色/深色调色板 + QSS 模板 + 主题管理器
 ├── version.py            # 版本号 / 作者 / 项目代号（版本信息唯一来源）
@@ -137,7 +156,7 @@ npm加速器/
 ├── 启动NPM加速器.bat      # 开发态一键启动
 ├── AGENTS.md             # AI Agent 协作上下文
 ├── .trellis/             # Trellis 工作流（规范/任务/会话记忆）
-├── tests/                # 回归自检脚本（.npmrc / 主题 / GUI 冒烟 / 真实安装）
+├── tests/                # 回归自检脚本（.npmrc / 主题 / GUI 冒烟 / 真实安装 / GitHub 加速）
 ├── docs/                 # 主题预览图（浅色 / 深色）
 └── dist/
     └── NPM加速器.exe     # 免安装单文件版（编译产物，不入库）
@@ -161,7 +180,13 @@ python tests/smoke_gui.py
 # 5) 真实安装端到端（需联网，使用隔离的临时缓存目录）
 python tests/verify_proxy_install.py
 
-# 6) 打包后的 exe 自检（无窗口；结果写入 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
+# 6) GitHub 加速离线回归（域名判定 / DoH 解析 / 隧道转发 / git 配置备份还原）
+python tests/test_github_boost.py
+
+# 7) GitHub 加速真实端到端（需联网：curl 与 git 经本地加速代理拉取）
+python tests/verify_github_boost.py
+
+# 8) 打包后的 exe 自检（无窗口；结果写入 %TEMP%\npm-accelerator-selftest.txt，退出码 0 为通过）
 dist\NPM加速器.exe --selftest
 
 # 重新打包 exe
@@ -169,6 +194,23 @@ python -m PyInstaller --noconfirm --clean "NPM加速器.spec"
 ```
 
 ## 🛠️ 更新记录
+
+### v1.1.0 —— 新增 GitHub 加速（2026-10-16）
+
+新增第 6 个功能页「GitHub 加速」，解决 GitHub 打不开、`git clone` / `git pull` 卡住的问题。
+思路与 FastGithub 同源（绕开被污染/被改写的 DNS，直连实测最快的 IP），但实现上做了两点简化：
+
+- **不做 TLS 中间人**：本地只开一个 CONNECT 隧道，SNI 与证书仍由客户端与 GitHub 直接协商，
+  所以不需要生成、分发、信任自签 CA，也不需要让 git 关掉 `http.sslverify`
+- **不改 hosts**：不需要管理员权限，也不会和 Steam++ 这类同样改写 hosts 的工具抢域名
+
+工作流程：DoH（阿里/腾讯/360）解析候选 IP → 对每个 IP 做 TCP + TLS 握手（SNI 校验证书）
++ 发一个 HEAD 请求三重确认、按握手耗时排序 → CONNECT 时把目标 IP 换成优选 IP。
+实测 16 个域名 15 个可用，`curl` 与 `git ls-remote` 经代理均成功，且全程未回退系统解析。
+
+同时新增「上游零响应」自愈：某个优选 IP 连得上却一个字节都不回时会被标记，
+后续连接优先换用其它候选（实测 `raw.githubusercontent.com` 确实存在这种 IP）。
+
 
 ### v1.0.0 —— 首个公开发布版（2026-10-15）
 

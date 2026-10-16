@@ -9,6 +9,7 @@ import subprocess
 
 from PySide6.QtCore import QThread, Signal
 
+import github_boost
 import npm_manager
 import proxy_server
 
@@ -96,6 +97,45 @@ class ProxyActionThread(QThread):
             ok, msg = proxy_server.stop_proxy()
         elif self.action == "clear_cache":
             ok, msg = proxy_server.clear_proxy_cache()
+        else:
+            ok, msg = False, f"未知操作 {self.action}"
+        self.finished_sig.emit(ok, msg)
+
+
+class GithubSpeedThread(QThread):
+    """刷新 GitHub 优选 IP（DoH 解析 + TLS 实测），并把进度回传界面。"""
+    progress = Signal(int, int, str)
+    finished_sig = Signal(dict)
+
+    def run(self):
+        try:
+            summary = github_boost.refresh_all(on_progress=self._emit_progress)
+        except Exception as e:
+            summary = {"error": f"{type(e).__name__}: {str(e)[:80]}"}
+        self.finished_sig.emit(summary)
+
+    def _emit_progress(self, done, total, label):
+        self.progress.emit(done, total, label)
+
+
+class GithubActionThread(QThread):
+    """启停 GitHub 加速 / 配置或还原 git 的 GitHub 代理。"""
+    finished_sig = Signal(bool, str)
+
+    def __init__(self, action: str, parent=None):
+        super().__init__(parent)
+        self.action = action
+
+    def run(self):
+        if self.action == "start":
+            # 启动时不在这里刷新优选：另起 GithubSpeedThread，界面才看得到进度
+            ok, msg = github_boost.start_proxy(refresh=False)
+        elif self.action == "stop":
+            ok, msg = github_boost.stop_proxy()
+        elif self.action == "git_apply":
+            ok, msg = github_boost.apply_git_proxy()
+        elif self.action == "git_restore":
+            ok, msg = github_boost.restore_git_proxy()
         else:
             ok, msg = False, f"未知操作 {self.action}"
         self.finished_sig.emit(ok, msg)
