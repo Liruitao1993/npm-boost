@@ -93,6 +93,29 @@ nv = npm_manager.node_version()
 check("Node 版本形如 vXX", nv.startswith("v") and nv[1].isdigit(), nv)
 check("format_size(1536KB) -> 1.5 MB", npm_manager.format_size(1536 * 1024) == "1.5 MB")
 
+print("7) 目录体积统计（「缓存大小」显示缺陷回归）")
+tree = tmp / "sizetree"
+(tree / "a" / "b").mkdir(parents=True)
+(tree / "f1.bin").write_bytes(b"x" * 1024)
+(tree / "a" / "f2.bin").write_bytes(b"x" * 2048)
+(tree / "a" / "b" / "f3.bin").write_bytes(b"x" * 4096)
+bulk = tree / "bulk"
+bulk.mkdir()
+for i in range(600):
+    (bulk / f"n{i}.bin").write_bytes(b"y" * 10)
+expected = 1024 + 2048 + 4096 + 600 * 10
+size, complete = npm_manager.dir_size(tree)
+check("嵌套 + 多文件目录体积精确", complete and size == expected, f"{size} B / 期望 {expected} B")
+check("不存在的目录返回 (0, True)", npm_manager.dir_size(tmp / "no-such-dir") == (0, True))
+part, part_complete = npm_manager.dir_size(tree, max_files=1)
+check("触发文件数上限时如实返回未统计完", part_complete is False and part < expected, f"{part} B")
+check("触发时间上限时如实返回未统计完", npm_manager.dir_size(tree, max_seconds=0)[1] is False)
+check("完整统计的文案不带 ≥", npm_manager.describe_dir_size(tree) == npm_manager.format_size(expected))
+truncated = npm_manager.describe_dir_size(tree, max_files=1)
+check("截断时文案带 ≥ 与「未统计完」", truncated.startswith("≥ ") and truncated.endswith("（未统计完）"),
+      truncated)
+check("format_size(用户缓存真实体积) -> 644.6 MB",
+      npm_manager.format_size(675915216) == "644.6 MB", npm_manager.format_size(675915216))
 print()
 print("结果:", "全部通过" if not failures else f"失败 {len(failures)} 项 {failures}")
 sys.exit(1 if failures else 0)

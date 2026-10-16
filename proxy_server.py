@@ -423,25 +423,6 @@ def proxy_registry_url() -> str:
     return _proxy_base()
 
 
-def cache_disk_usage() -> str:
-    """缓存目录体积（限制遍历量，避免大缓存卡住调用方）。"""
-    root = _cache_root()
-    if not root.exists():
-        return "0 MB"
-    total = 0
-    scanned = 0
-    try:
-        for p in root.rglob("*"):
-            if p.is_file():
-                total += p.stat().st_size
-                scanned += 1
-                if scanned > 200000:
-                    break
-    except OSError:
-        pass
-    return f"{total / 1024 ** 3:.2f} GB" if total >= 1024 ** 3 else f"{total / 1024 ** 2:.1f} MB"
-
-
 def clear_proxy_cache() -> tuple:
     """清空代理缓存目录。"""
     root = _cache_root()
